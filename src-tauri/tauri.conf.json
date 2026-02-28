@@ -1,0 +1,28 @@
+{
+  "productName": "musicboxd",
+  "version": "0.1.0",
+  "identifier": "com.musicboxd.app",
+  "build": {
+    "beforeDevCommand": "cargo leptos watch",
+    "devUrl": "http://localhost:9090",
+    "beforeBuildCommand": "cargo leptos build --release",
+    "frontendDist": "../target/site"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Musicboxd",
+        "width": 1200,
+        "height": 800
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
+  }
+}

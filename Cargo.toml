@@ -1,0 +1,76 @@
+[workspace]
+members = ["src-tauri"]
+resolver = "2"
+
+[package]
+name = "musicboxd"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[package.metadata.leptos]
+output-name = "musicboxd"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+assets-dir = "public"
+site-addr = "127.0.0.1:9090"
+reload-port = 3001
+env = "DEV"
+bin-features = ["ssr"]
+bin-default-features = false
+lib-features = ["hydrate"]
+lib-default-features = false
+lib-profile-release = "wasm-release"
+
+[dependencies]
+leptos = { version = "0.7", features = [] }
+leptos_meta = { version = "0.7" }
+leptos_router = { version = "0.7" }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+
+[dependencies.leptos_axum]
+version = "0.7"
+optional = true
+
+[dependencies.axum]
+version = "0.7"
+optional = true
+
+[dependencies.tower]
+version = "0.4"
+optional = true
+
+[dependencies.tower-http]
+version = "0.5"
+features = ["fs"]
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros"]
+optional = true
+
+[features]
+hydrate = [
+    "leptos/hydrate",
+]
+ssr = [
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:tokio",
+    "dep:leptos_axum",
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+]

@@ -28,28 +28,31 @@ Every feature must be covered by tests. Tests must be **breakable** — if you d
 
 | Command | Purpose |
 |---|---|
-| `npm run dev` | Start Vite dev server at http://localhost:9090 (web only) |
-| `npm run tauri dev` | Start Tauri desktop app (requires Rust/Cargo) |
-| `npm run build` | TypeScript check + Vite production build |
+| `cargo leptos watch` | Start SSR dev server at http://localhost:9090 with hot-reload |
+| `cargo leptos build --release` | Production build (server binary + WASM bundle) |
+| `cargo check --features ssr` | Fast SSR type-check (no build output) |
+| `cargo check --target wasm32-unknown-unknown --features hydrate` | Fast WASM type-check |
+| `npm run tauri dev` | Start Tauri desktop app (runs `cargo leptos watch` internally) |
 
 ## Architecture
 
 ```
 musicboxd/
-├── src/                  # React frontend (TypeScript)
-│   ├── main.tsx          # React entry point
-│   └── App.tsx           # Root component
-├── src-tauri/            # Tauri/Rust backend
-│   ├── src/
-│   │   ├── main.rs       # Binary entry point
-│   │   └── lib.rs        # App setup (tauri::Builder)
-│   ├── capabilities/     # Tauri v2 permission definitions
-│   └── tauri.conf.json   # Tauri config (devUrl, bundle, windows)
-├── index.html            # HTML entry point
-└── vite.config.ts        # Vite config (port 9090, ignores src-tauri/)
+├── Cargo.toml            # Workspace root + Leptos app package (both in one)
+├── src/
+│   ├── app.rs            # Leptos components: shell(), App, routes, pages
+│   ├── lib.rs            # Crate root: pub mod app + hydrate() WASM entry
+│   └── main.rs           # SSR binary entry: Axum server setup
+├── public/               # Static assets (copied to target/site/)
+└── src-tauri/            # Tauri v2 desktop wrapper (package: musicboxd-tauri)
+    ├── src/
+    │   ├── main.rs       # Tauri binary entry
+    │   └── lib.rs        # tauri::Builder setup
+    ├── capabilities/     # Tauri v2 permission definitions
+    └── tauri.conf.json   # devUrl → localhost:9090, beforeDevCommand → cargo leptos watch
 ```
 
-Web development uses `npm run dev` only (no Rust required). `npm run tauri dev` runs the full desktop app — it starts `npm run dev` internally via `beforeDevCommand` and loads `http://localhost:9090`.
+The app is **Leptos 0.7 SSR** with Axum. `cargo leptos watch` compiles two targets simultaneously: a native Rust server binary (SSR, `--features ssr`) and a WASM bundle (client hydration, `--features hydrate`). The server renders HTML on the first request; the WASM bundle hydrates it in the browser. Port 9090. `src-tauri/` is a Tauri v2 wrapper that loads the Leptos server via webview for native builds — not needed for web development.
 
 ## Documentation
 
