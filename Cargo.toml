@@ -66,6 +66,16 @@ version = "0.12"
 features = ["json"]
 optional = true
 
+[dependencies.sqlx]
+version = "0.8"
+features = ["runtime-tokio", "sqlite", "uuid", "migrate"]
+optional = true
+
+[dependencies.uuid]
+version = "1"
+features = ["v4"]
+optional = true
+
 [features]
 hydrate = [
     "leptos/hydrate",
@@ -77,6 +87,8 @@ ssr = [
     "dep:tokio",
     "dep:leptos_axum",
     "dep:reqwest",
+    "dep:sqlx",
+    "dep:uuid",
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",
