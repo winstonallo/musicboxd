@@ -81,6 +81,10 @@ version = "5"
 features = ["reqwest"]
 optional = true
 
+[dependencies.httpdate]
+version = "1"
+optional = true
+
 [dev-dependencies]
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -99,6 +103,7 @@ ssr = [
     "dep:sqlx",
     "dep:uuid",
     "dep:oauth2",
+    "dep:httpdate",
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",

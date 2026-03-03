@@ -401,15 +401,18 @@ pub mod server {
         .execute(pool)
         .await?;
 
-        let max_age = 30 * 24 * 60 * 60;
+        let max_age = 30u64 * 24 * 60 * 60;
+        let expires = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(max_age),
+        );
         Ok(Response::builder()
             .status(StatusCode::FOUND)
             .header(header::LOCATION, "/")
             .header(
                 header::SET_COOKIE,
                 format!(
-                    "session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
-                    session_id, max_age
+                    "session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}; Expires={}",
+                    session_id, max_age, expires
                 ),
             )
             .body(axum::body::Body::empty())
