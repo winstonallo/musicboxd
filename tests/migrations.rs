@@ -16,9 +16,11 @@ async fn all_tables_exist(pool: SqlitePool) {
         "oauth_accounts",
         "oauth_states",
         "ratings",
-        "release_group_external_ids",
         "release_groups",
         "sessions",
+        "spotify_albums",
+        "spotify_search_cache",
+        "spotify_tracks",
         "users",
     ] {
         assert!(

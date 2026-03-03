@@ -41,6 +41,16 @@ pub struct AlbumDetail {
     pub tracks: Vec<Track>,
 }
 
+/// A page of search results together with the total result count.
+/// Ungated so both the SSR binary and WASM hydration can (de)serialize it.
+/// `total` is the total number of cached results (≤50), used by the client
+/// to compute the page count without an extra round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchPage {
+    pub albums: Vec<SpotifyAlbum>,
+    pub total: usize,
+}
+
 #[server]
 pub async fn get_current_user() -> Result<Option<String>, ServerFnError> {
     use crate::auth::server::CurrentUser;
@@ -50,13 +60,14 @@ pub async fn get_current_user() -> Result<Option<String>, ServerFnError> {
 }
 
 #[server]
-pub async fn search_music(query: String) -> Result<Vec<SpotifyAlbum>, ServerFnError> {
+pub async fn search_music(query: String, page: u32) -> Result<SearchPage, ServerFnError> {
     use crate::spotify::SpotifyClient;
     use axum::Extension;
     use sqlx::SqlitePool;
+    let page = page.max(1);
     let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
     let Extension(spotify): Extension<SpotifyClient> = leptos_axum::extract().await?;
-    spotify.search(&pool, &query).await
+    spotify.search(&pool, &query, page).await
 }
 
 #[server]
@@ -109,25 +120,51 @@ fn HomePage() -> impl IntoView {
     let query_map = use_query_map();
     let navigate = use_navigate();
 
-    // Query is the URL's ?q parameter so it survives back-navigation and refresh.
+    // Query lives in the URL so back-navigation and refresh restore it.
     let url_q = move || query_map.read().get("q").unwrap_or_default();
 
-    // Text box tracks what the user is typing; initialised from the URL so a
-    // refresh or back-button press restores the visible query.
+    // Text box mirrors the URL query; kept in sync by the Effect below.
     let (input, set_input) = signal(url_q());
-
-    // When the URL changes (e.g. browser back button), resync the text box.
     Effect::new(move |_| set_input.set(url_q()));
 
     let current_user = Resource::new(|| (), |_| get_current_user());
 
-    let results = Resource::new(url_q, |q| async move {
-        if q.trim().is_empty() {
-            Ok(vec![])
+    // Infinite scroll: page number is in-memory only — scrolling is a session
+    // gesture, not something to encode in the URL.
+    let (page, set_page) = signal(1u32);
+    let (albums, set_albums) = signal(Vec::<SpotifyAlbum>::new());
+
+    // When the query changes, reset accumulated results and restart from page 1.
+    Effect::new(move |prev_q: Option<String>| {
+        let q = url_q();
+        if prev_q.as_deref() != Some(&q) {
+            set_page.set(1);
+            set_albums.set(vec![]);
+        }
+        q
+    });
+
+    let page_result = Resource::new(
+        move || (url_q(), page.get()),
+        |(q, p)| async move {
+            if q.trim().is_empty() {
+                return Ok(SearchPage { albums: vec![], total: 0 });
+            }
+            search_music(q, p).await
+        },
+    );
+
+    // Accumulate pages: replace on page 1 (fresh query), append on later pages.
+    Effect::new(move |_| {
+        let Some(Ok(result)) = page_result.get() else { return };
+        let fetched = result.albums;
+        if page.get_untracked() == 1 {
+            set_albums.set(fetched);
         } else {
-            search_music(q).await
+            set_albums.update(|a| a.extend(fetched));
         }
     });
+
 
     view! {
         <header class="site-header">
@@ -174,53 +211,63 @@ fn HomePage() -> impl IntoView {
             />
             <button class="search-btn" type="submit">"Search"</button>
         </form>
-        <Suspense fallback=move || view! { <p class="status-msg">"Searching..."</p> }>
-            {move || {
-                if url_q().trim().is_empty() {
-                    return None;
-                }
-                results.get().map(|res| {
-                    match res {
-                        Ok(albums) if albums.is_empty() => {
-                            view! { <p class="status-msg">"No results found."</p> }.into_any()
+        {move || {
+            if url_q().trim().is_empty() {
+                return None;
+            }
+            Some(view! {
+                <ul class="results-list">
+                    {move || albums.get().into_iter().map(|album| {
+                        let cover_src = format!("/album-art/{}", album.spotify_id);
+                        let href = format!("/album/{}", album.spotify_id);
+                        let artists = album.artists.join(", ");
+                        let year = album
+                            .release_year
+                            .map(|y| y.to_string())
+                            .unwrap_or_else(|| "????".to_string());
+                        view! {
+                            <li class="result-card">
+                                <A href=href attr:class="result-card-link">
+                                    <img class="result-cover" src=cover_src alt="Album cover" width="72" height="72"/>
+                                    <div class="result-info">
+                                        <span class="result-title">{album.title}</span>
+                                        <span class="result-artist">{artists}</span>
+                                        <div class="result-meta">
+                                            <span class="result-type">{album.album_type}</span>
+                                            <span class="result-year">{year}</span>
+                                        </div>
+                                    </div>
+                                </A>
+                            </li>
                         }
-                        Ok(albums) => {
-                            view! {
-                                <ul class="results-list">
-                                    {albums.into_iter().map(|album| {
-                                        let cover_src = format!("/album-art/{}", album.spotify_id);
-                                        let href = format!("/album/{}", album.spotify_id);
-                                        let artists = album.artists.join(", ");
-                                        let year = album
-                                            .release_year
-                                            .map(|y| y.to_string())
-                                            .unwrap_or_else(|| "????".to_string());
-                                        view! {
-                                            <li class="result-card">
-                                                <A href=href attr:class="result-card-link">
-                                                    <img class="result-cover" src=cover_src alt="Album cover" width="72" height="72"/>
-                                                    <div class="result-info">
-                                                        <span class="result-title">{album.title}</span>
-                                                        <span class="result-artist">{artists}</span>
-                                                        <div class="result-meta">
-                                                            <span class="result-type">{album.album_type}</span>
-                                                            <span class="result-year">{year}</span>
-                                                        </div>
-                                                    </div>
-                                                </A>
-                                            </li>
-                                        }
-                                    }).collect_view()}
-                                </ul>
-                            }.into_any()
-                        }
-                        Err(e) => {
-                            view! { <p class="status-msg">"Error: " {e.to_string()}</p> }.into_any()
-                        }
+                    }).collect_view()}
+                </ul>
+                <Suspense fallback=move || {
+                    if albums.with(Vec::is_empty) {
+                        view! { <p class="status-msg">"Searching..."</p> }.into_any()
+                    } else {
+                        view! { <p class="status-msg">"Loading..."</p> }.into_any()
                     }
-                })
-            }}
-        </Suspense>
+                }>
+                    {move || page_result.get().map(|res| match res {
+                        Err(e) => view! {
+                            <p class="status-msg">"Error: " {e.to_string()}</p>
+                        }.into_any(),
+                        Ok(r) if r.albums.is_empty() && page.get() == 1 => view! {
+                            <p class="status-msg">"No results found."</p>
+                        }.into_any(),
+                        Ok(_) => view! {
+                            <div class="load-more-bar">
+                                <button class="load-more-btn"
+                                    on:click=move |_| set_page.update(|p| *p += 1)>
+                                    "Load more"
+                                </button>
+                            </div>
+                        }.into_any(),
+                    })}
+                </Suspense>
+            })
+        }}
     }
 }
 

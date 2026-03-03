@@ -1,6 +1,6 @@
 #![cfg(feature = "ssr")]
 
-use crate::app::{AlbumDetail, SpotifyAlbum, Track};
+use crate::app::{AlbumDetail, SearchPage, SpotifyAlbum, Track};
 use leptos::server_fn::error::ServerFnError;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
@@ -19,6 +19,7 @@ struct SpotifySearchResponse {
 #[derive(Deserialize)]
 struct SpotifyAlbumPage {
     items: Vec<SpotifyApiAlbum>,
+    total: u32,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +101,20 @@ pub struct SpotifyClient {
 }
 
 impl SpotifyClient {
+    /// Returns a client with empty credentials for use in tests that only
+    /// exercise the DB cache path. Any call that reaches the Spotify API will
+    /// fail with an auth error, so tests must pre-seed the cache to avoid
+    /// making real network requests.
+    #[cfg(test)]
+    pub fn new_test() -> Self {
+        Self {
+            client_id: String::new(),
+            client_secret: String::new(),
+            http: reqwest::Client::new(),
+            token_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
     /// Returns a no-op client used when Spotify credentials are absent.
     /// Every method on this client will return a descriptive error rather than
     /// panicking, so the server starts up gracefully and surfaces a clear message
@@ -192,40 +207,55 @@ impl SpotifyClient {
     }
 
     /// Cache-first album search. Normalises the query, checks the
-    /// `spotify_search_cache` table (24-hour TTL), and falls back to the
-    /// Spotify search API when the cache misses. Results are upserted into
-    /// `spotify_albums`; every 100th hit triggers a background metadata
-    /// refresh, and cover art is fetched in the background for any album
-    /// that doesn't have it yet.
+    /// `spotify_search_cache` table (24-hour TTL) for the requested page's
+    /// offset, and falls back to the Spotify API when the cache misses. Results
+    /// are upserted into `spotify_albums`; every 100th hit triggers a background
+    /// metadata refresh, and cover art is fetched in the background for any
+    /// album that doesn't have it yet.
+    ///
+    /// Each page is cached independently by `(query, offset)`, so navigating to
+    /// page 3 triggers an API call with `offset=20` — we never need to fetch all
+    /// results upfront. Spotify's `total` field is stored in each cache row so
+    /// the UI can compute the page count from any cached page.
     pub async fn search(
         &self,
         pool: &SqlitePool,
         query: &str,
-    ) -> Result<Vec<SpotifyAlbum>, ServerFnError> {
+        page: u32,
+    ) -> Result<SearchPage, ServerFnError> {
+        const PAGE_SIZE: u32 = 10;
+
         let normalized = query
             .to_lowercase()
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Cache hit: load IDs from spotify_search_cache, then fetch each album row.
-        let cached_ids: Option<String> = sqlx::query_scalar(
-            "SELECT spotify_ids FROM spotify_search_cache \
-             WHERE query = ? AND datetime(cached_at, '+1 day') > datetime('now')",
+        let offset = page.saturating_sub(1) * PAGE_SIZE;
+
+        // Cache hit: load IDs and total from spotify_search_cache for this offset.
+        let cache_row = sqlx::query(
+            "SELECT spotify_ids, total FROM spotify_search_cache \
+             WHERE query = ? AND result_offset = ? \
+             AND datetime(cached_at, '+1 day') > datetime('now')",
         )
         .bind(&normalized)
+        .bind(offset as i64)
         .fetch_optional(pool)
         .await
         .map_err(|e| ServerFnError::new(format!("spotify search cache read: {e}")))?;
 
-        if let Some(ids_json) = cached_ids {
+        if let Some(row) = cache_row {
+            let ids_json: String = row.get("spotify_ids");
+            let total: i64 = row.get("total");
             let ids: Vec<String> = serde_json::from_str(&ids_json)
                 .map_err(|e| ServerFnError::new(format!("spotify search cache parse: {e}")))?;
-            return self.load_albums_by_ids_and_bump(pool, &ids).await;
+            let albums = self.load_albums_by_ids_and_bump(pool, &ids).await?;
+            return Ok(SearchPage { albums, total: total as usize });
         }
 
-        // Cache miss: hit the Spotify API.
-        let api_albums = self.search_api(&normalized).await?;
+        // Cache miss: hit the Spotify API with the appropriate offset.
+        let (api_albums, spotify_total) = self.search_api(&normalized, offset).await?;
 
         let mut result_ids: Vec<String> = Vec::with_capacity(api_albums.len());
         let mut albums: Vec<SpotifyAlbum> = Vec::with_capacity(api_albums.len());
@@ -233,6 +263,11 @@ impl SpotifyClient {
         for api_album in api_albums {
             let spotify_id = api_album.id.clone();
             let album = spotify_album_from_api(&api_album);
+
+            if relevance_score(&normalized, &album.title, &album.artists) < 0.5 {
+                continue;
+            }
+
             let cover_art_url = best_image_url(&api_album.images);
             let raw_json = serde_json::to_string(&AlbumRaw {
                 id: &api_album.id,
@@ -300,20 +335,26 @@ impl SpotifyClient {
             albums.push(album);
         }
 
-        // Write search results into the cache table.
+        // Cache this page by (query, offset).
         let ids_json = serde_json::to_string(&result_ids)
             .map_err(|e| ServerFnError::new(format!("spotify ids serialize: {e}")))?;
         sqlx::query(
-            "INSERT OR REPLACE INTO spotify_search_cache (query, spotify_ids, cached_at) \
-             VALUES (?, ?, datetime('now'))",
+            "INSERT OR REPLACE INTO spotify_search_cache \
+             (query, result_offset, spotify_ids, total, cached_at) \
+             VALUES (?, ?, ?, ?, datetime('now'))",
         )
         .bind(&normalized)
+        .bind(offset as i64)
         .bind(&ids_json)
+        .bind(spotify_total as i64)
         .execute(pool)
         .await
         .map_err(|e| ServerFnError::new(format!("spotify search cache write: {e}")))?;
 
-        Ok(albums)
+        Ok(SearchPage {
+            albums,
+            total: spotify_total as usize,
+        })
     }
 
     /// Fetches a single album by Spotify ID, checking the local DB first.
@@ -574,16 +615,27 @@ impl SpotifyClient {
         Ok(Some(tracks))
     }
 
-    /// Calls the Spotify search API and returns the raw parsed response items.
-    /// 429 and non-2xx responses are turned into descriptive errors so callers
-    /// can propagate or surface them appropriately.
-    async fn search_api(&self, query: &str) -> Result<Vec<SpotifyApiAlbum>, ServerFnError> {
+    /// Calls the Spotify search API with a specific offset and returns the items
+    /// together with the total result count Spotify reports for the query.
+    /// Limit is fixed at 10 (the current Spotify maximum as of February 2026).
+    /// 429 and non-2xx responses are turned into descriptive errors.
+    async fn search_api(
+        &self,
+        query: &str,
+        offset: u32,
+    ) -> Result<(Vec<SpotifyApiAlbum>, u32), ServerFnError> {
         let token = self.token().await?;
+        let offset_str = offset.to_string();
 
         let response = self
             .http
             .get("https://api.spotify.com/v1/search")
-            .query(&[("q", query), ("type", "album"), ("limit", "10")])
+            .query(&[
+                ("q", query),
+                ("type", "album"),
+                ("limit", "10"),
+                ("offset", &offset_str),
+            ])
             .bearer_auth(&token)
             .send()
             .await
@@ -598,8 +650,9 @@ impl SpotifyClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(ServerFnError::new(format!(
-                "Spotify search failed: HTTP {status}"
+                "Spotify search failed: HTTP {status} — {body}"
             )));
         }
 
@@ -608,7 +661,7 @@ impl SpotifyClient {
             .await
             .map_err(|e| ServerFnError::new(format!("spotify search parse: {e}")))?;
 
-        Ok(body.albums.items)
+        Ok((body.albums.items, body.albums.total))
     }
 
     /// Downloads cover art bytes from a public Spotify CDN URL and stores them
@@ -941,6 +994,39 @@ fn best_image_url(images: &[SpotifyImage]) -> Option<String> {
         .map(|img| img.url.clone())
 }
 
+/// Computes what fraction of the query's tokens appear in the combined token
+/// set of `title` and `artists`. Both sides are normalised by lowercasing and
+/// splitting on non-alphanumeric characters so punctuation differences (e.g.
+/// "mac's" vs "mac") do not create spurious mismatches.
+///
+/// Spotify requests `limit=50` to give the ranking algorithm room, but the
+/// tail of a 50-item response is often unrelated to the query. Filtering on
+/// this score before adding results to the cache and DB keeps the stored data
+/// relevant and avoids surfacing noise in the UI.
+fn relevance_score(query: &str, title: &str, artists: &[String]) -> f64 {
+    fn tokenize(s: &str) -> Vec<String> {
+        s.chars()
+            .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    let query_tokens = tokenize(query);
+    if query_tokens.is_empty() {
+        return 1.0;
+    }
+
+    let mut target: std::collections::HashSet<String> = tokenize(title).into_iter().collect();
+    for artist in artists {
+        target.extend(tokenize(artist));
+    }
+
+    let matches = query_tokens.iter().filter(|t| target.contains(*t)).count();
+    matches as f64 / query_tokens.len() as f64
+}
+
 /// Reads the `Retry-After` header from a 429 response and parses it as a
 /// number of seconds. Defaults to 5 when the header is absent or unparseable,
 /// which is a reasonable back-off that avoids hammering the API.
@@ -960,4 +1046,71 @@ fn retry_after_secs(response: &reqwest::Response) -> u64 {
 struct AlbumRaw<'a> {
     id: &'a str,
     name: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relevance_score;
+
+    #[test]
+    fn exact_title_match() {
+        assert_eq!(relevance_score("rumours", "Rumours", &["Fleetwood Mac".to_string()]), 1.0);
+    }
+
+    #[test]
+    fn artist_only_match() {
+        // Query is purely an artist name; the album title is unrelated.
+        assert_eq!(
+            relevance_score("fleetwood mac", "Rumours", &["Fleetwood Mac".to_string()]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn multi_word_title_match() {
+        assert_eq!(
+            relevance_score(
+                "dark side of the moon",
+                "The Dark Side of the Moon",
+                &["Pink Floyd".to_string()]
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn partial_match_above_threshold() {
+        // 2 of 3 query tokens present → 0.67, above 0.5.
+        let score = relevance_score(
+            "ok computer radiohead",
+            "OK Computer",
+            &["Radiohead".to_string()],
+        );
+        assert!(score >= 0.5, "expected ≥ 0.5, got {score}");
+    }
+
+    #[test]
+    fn unrelated_result_below_threshold() {
+        let score = relevance_score(
+            "dark side of the moon",
+            "Wish You Were Here",
+            &["Pink Floyd".to_string()],
+        );
+        assert!(score < 0.5, "expected < 0.5, got {score}");
+    }
+
+    #[test]
+    fn punctuation_normalised() {
+        // Apostrophe in artist name should not prevent matching.
+        assert_eq!(
+            relevance_score("guns n roses", "Appetite for Destruction", &["Guns N' Roses".to_string()]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn empty_query_returns_full_score() {
+        assert_eq!(relevance_score("", "Anything", &[]), 1.0);
+    }
+
 }
