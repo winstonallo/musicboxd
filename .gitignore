@@ -10,3 +10,5 @@ target/
 # SQLite database files
 musicboxd.db
 musicboxd.db-*
+
+.env
