@@ -76,6 +76,10 @@ Errors must never be silently swallowed. Every error must be handled explicitly 
 
 Prefer the simplest solution that fully meets the requirements. Do not add complexity in anticipation of future needs. When a simpler approach requires dropping or limiting functionality, flag the tradeoff explicitly and get approval before proceeding — never silently sacrifice features for the sake of cleaner code.
 
+## Warnings
+
+Zero warnings are tolerated. Compilation must produce no warnings, and `cargo clippy -- -D warnings` must pass at every commit. Fix warnings immediately; do not suppress them with `#[allow(...)]` unless there is a specific, documented reason that fixing the warning is genuinely not possible.
+
 ## Code hygiene
 
 Unused code is useless and must be removed. Dead code, unreferenced exports, unused variables, and commented-out blocks all add noise without value. Delete them.
