@@ -85,6 +85,10 @@ optional = true
 version = "1"
 optional = true
 
+[dependencies.serde_json]
+version = "1"
+optional = true
+
 [dev-dependencies]
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -104,6 +108,7 @@ ssr = [
     "dep:uuid",
     "dep:oauth2",
     "dep:httpdate",
+    "dep:serde_json",
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",

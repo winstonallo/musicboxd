@@ -1,0 +1,766 @@
+#![cfg(feature = "ssr")]
+
+use crate::app::SpotifyAlbum;
+use leptos::server_fn::error::ServerFnError;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use serde::Deserialize;
+use sqlx::{Row, SqlitePool};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+// Internal structs for deserializing Spotify API responses.
+
+#[derive(Deserialize)]
+struct SpotifySearchResponse {
+    albums: SpotifyAlbumPage,
+}
+
+#[derive(Deserialize)]
+struct SpotifyAlbumPage {
+    items: Vec<SpotifyApiAlbum>,
+}
+
+#[derive(Deserialize)]
+struct SpotifyApiAlbum {
+    id: String,
+    name: String,
+    artists: Vec<SpotifyApiArtist>,
+    album_type: String,
+    release_date: Option<String>,
+    images: Vec<SpotifyImage>,
+}
+
+#[derive(Deserialize)]
+struct SpotifyApiArtist {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct SpotifyImage {
+    url: String,
+    width: Option<u32>,
+}
+
+// Internal struct for deserializing the Spotify token endpoint response.
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    expires_in: u64,
+}
+
+// Holds a cached bearer token with its expiry instant so we can avoid re-fetching
+// on every request while still rotating before it actually expires.
+struct CachedToken {
+    token: String,
+    expires_at: Instant,
+}
+
+// Database row shape matching the spotify_albums table columns we actually
+// need when converting to SpotifyAlbum. cover_art_url is queried separately
+// (via query_scalar) in refresh_album, so it is not included here.
+struct DbSpotifyAlbum {
+    spotify_id: String,
+    title: String,
+    artists: String, // JSON array of display-name strings
+    album_type: Option<String>,
+    release_date: Option<String>,
+    cover_art: Option<Vec<u8>>,
+}
+
+/// Client for the Spotify Web API. Holds credentials, a shared HTTP client,
+/// and a token cache so a single instance can be shared across the app via
+/// Axum Extension without redundant token fetches.
+///
+/// All fields except the token cache are immutable after construction, so
+/// deriving Clone is safe and cheap (Arc makes the Mutex clone O(1)).
+#[derive(Clone)]
+pub struct SpotifyClient {
+    client_id: String,
+    client_secret: String,
+    http: reqwest::Client,
+    token_cache: Arc<Mutex<Option<CachedToken>>>,
+}
+
+impl SpotifyClient {
+    /// Returns a no-op client used when Spotify credentials are absent.
+    /// Every method on this client will return a descriptive error rather than
+    /// panicking, so the server starts up gracefully and surfaces a clear message
+    /// to users instead of crashing.
+    pub fn unconfigured() -> Self {
+        Self {
+            client_id: String::new(),
+            client_secret: String::new(),
+            http: reqwest::Client::new(),
+            token_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Constructs a client from `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`
+    /// environment variables. A `User-Agent` default header is baked in so every
+    /// request identifies the app to Spotify's servers.
+    pub fn from_env() -> Result<Self, String> {
+        let client_id = std::env::var("SPOTIFY_CLIENT_ID")
+            .map_err(|_| "SPOTIFY_CLIENT_ID not set".to_string())?;
+        let client_secret = std::env::var("SPOTIFY_CLIENT_SECRET")
+            .map_err(|_| "SPOTIFY_CLIENT_SECRET not set".to_string())?;
+
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static("musicboxd/0.1"),
+        );
+
+        let http = reqwest::Client::builder()
+            .default_headers(default_headers)
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+        Ok(Self {
+            client_id,
+            client_secret,
+            http,
+            token_cache: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Returns a valid bearer token, fetching a new one from Spotify's token
+    /// endpoint only when the cached one has less than 60 seconds of lifetime
+    /// remaining. The 60-second buffer prevents races where a token expires
+    /// between retrieval and use.
+    pub async fn token(&self) -> Result<String, ServerFnError> {
+        let mut cache = self.token_cache.lock().await;
+
+        if let Some(ref cached) = *cache {
+            if cached.expires_at > Instant::now() + Duration::from_secs(60) {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        let response = self
+            .http
+            .post("https://accounts.spotify.com/api/token")
+            .basic_auth(&self.client_id, Some(&self.client_secret))
+            .form(&[("grant_type", "client_credentials")])
+            .send()
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify token request: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let secs = retry_after_secs(&response);
+            return Err(ServerFnError::new(format!(
+                "Spotify rate limited — retry after {secs}s"
+            )));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(ServerFnError::new(format!(
+                "spotify token endpoint: HTTP {status}"
+            )));
+        }
+
+        let body: TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify token parse: {e}")))?;
+
+        let expires_at = Instant::now() + Duration::from_secs(body.expires_in.saturating_sub(60));
+        *cache = Some(CachedToken {
+            token: body.access_token.clone(),
+            expires_at,
+        });
+
+        Ok(body.access_token)
+    }
+
+    /// Cache-first album search. Normalises the query, checks the
+    /// `spotify_search_cache` table (24-hour TTL), and falls back to the
+    /// Spotify search API when the cache misses. Results are upserted into
+    /// `spotify_albums`; every 100th hit triggers a background metadata
+    /// refresh, and cover art is fetched in the background for any album
+    /// that doesn't have it yet.
+    pub async fn search(
+        &self,
+        pool: &SqlitePool,
+        query: &str,
+    ) -> Result<Vec<SpotifyAlbum>, ServerFnError> {
+        let normalized = query
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Cache hit: load IDs from spotify_search_cache, then fetch each album row.
+        let cached_ids: Option<String> = sqlx::query_scalar(
+            "SELECT spotify_ids FROM spotify_search_cache \
+             WHERE query = ? AND datetime(cached_at, '+1 day') > datetime('now')",
+        )
+        .bind(&normalized)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ServerFnError::new(format!("spotify search cache read: {e}")))?;
+
+        if let Some(ids_json) = cached_ids {
+            let ids: Vec<String> = serde_json::from_str(&ids_json)
+                .map_err(|e| ServerFnError::new(format!("spotify search cache parse: {e}")))?;
+            return self.load_albums_by_ids_and_bump(pool, &ids).await;
+        }
+
+        // Cache miss: hit the Spotify API.
+        let api_albums = self.search_api(&normalized).await?;
+
+        let mut result_ids: Vec<String> = Vec::with_capacity(api_albums.len());
+        let mut albums: Vec<SpotifyAlbum> = Vec::with_capacity(api_albums.len());
+
+        for api_album in api_albums {
+            let spotify_id = api_album.id.clone();
+            let album = spotify_album_from_api(&api_album);
+            let cover_art_url = best_image_url(&api_album.images);
+            let raw_json = serde_json::to_string(&AlbumRaw {
+                id: &api_album.id,
+                name: &api_album.name,
+            })
+            .unwrap_or_default();
+            let artists_json = serde_json::to_string(
+                &api_album
+                    .artists
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| ServerFnError::new(format!("spotify artists serialize: {e}")))?;
+
+            upsert_album(
+                pool,
+                &AlbumInsert {
+                    spotify_id: &spotify_id,
+                    title: &album.title,
+                    artists_json: &artists_json,
+                    album_type: &album.album_type,
+                    release_date: api_album.release_date.as_deref(),
+                    cover_art_url: cover_art_url.as_deref(),
+                    raw_json: &raw_json,
+                },
+            )
+            .await?;
+
+            // Increment hit count and check whether a background refresh is due.
+            let new_count: i64 = sqlx::query_scalar(
+                "UPDATE spotify_albums SET search_hit_count = search_hit_count + 1 \
+                 WHERE spotify_id = ? \
+                 RETURNING search_hit_count",
+            )
+            .bind(&spotify_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify hit count update: {e}")))?;
+
+            if new_count % 100 == 0 {
+                let self_clone = self.clone();
+                let pool_clone = pool.clone();
+                let id_clone = spotify_id.clone();
+                tokio::spawn(async move {
+                    self_clone.refresh_album(pool_clone, id_clone).await;
+                });
+            }
+
+            // Spawn cover-art fetch in the background for albums without art yet.
+            if !album.has_cover_art {
+                if let Some(url) = cover_art_url {
+                    let self_clone = self.clone();
+                    let pool_clone = pool.clone();
+                    let id_clone = spotify_id.clone();
+                    tokio::spawn(async move {
+                        self_clone
+                            .fetch_and_store_cover_art(pool_clone, id_clone, url)
+                            .await;
+                    });
+                }
+            }
+
+            result_ids.push(spotify_id);
+            albums.push(album);
+        }
+
+        // Write search results into the cache table.
+        let ids_json = serde_json::to_string(&result_ids)
+            .map_err(|e| ServerFnError::new(format!("spotify ids serialize: {e}")))?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO spotify_search_cache (query, spotify_ids, cached_at) \
+             VALUES (?, ?, datetime('now'))",
+        )
+        .bind(&normalized)
+        .bind(&ids_json)
+        .execute(pool)
+        .await
+        .map_err(|e| ServerFnError::new(format!("spotify search cache write: {e}")))?;
+
+        Ok(albums)
+    }
+
+    /// Fetches a single album by Spotify ID, checking the local DB first.
+    /// Falls back to the Spotify API and upserts the result when not cached.
+    pub async fn get_album(
+        &self,
+        pool: &SqlitePool,
+        spotify_id: &str,
+    ) -> Result<SpotifyAlbum, ServerFnError> {
+        // Check DB first.
+        if let Some(db_row) = fetch_db_album(pool, spotify_id).await? {
+            return Ok(spotify_album_from_db(&db_row));
+        }
+
+        let token = self.token().await?;
+
+        let response = self
+            .http
+            .get(format!(
+                "https://api.spotify.com/v1/albums/{}",
+                spotify_id
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify get album request: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let secs = retry_after_secs(&response);
+            return Err(ServerFnError::new(format!(
+                "Spotify rate limited — retry after {secs}s"
+            )));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(ServerFnError::new(format!(
+                "Spotify get album failed: HTTP {status}"
+            )));
+        }
+
+        let api_album: SpotifyApiAlbum = response
+            .json()
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify get album parse: {e}")))?;
+
+        let album = spotify_album_from_api(&api_album);
+        let cover_art_url = best_image_url(&api_album.images);
+        let artists_json = serde_json::to_string(
+            &api_album
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| ServerFnError::new(format!("spotify artists serialize: {e}")))?;
+        let raw_json = serde_json::to_string(&AlbumRaw {
+            id: &api_album.id,
+            name: &api_album.name,
+        })
+        .unwrap_or_default();
+
+        upsert_album(
+            pool,
+            &AlbumInsert {
+                spotify_id: &api_album.id,
+                title: &album.title,
+                artists_json: &artists_json,
+                album_type: &album.album_type,
+                release_date: api_album.release_date.as_deref(),
+                cover_art_url: cover_art_url.as_deref(),
+                raw_json: &raw_json,
+            },
+        )
+        .await?;
+
+        if !album.has_cover_art {
+            if let Some(url) = cover_art_url {
+                let self_clone = self.clone();
+                let pool_clone = pool.clone();
+                let id_clone = api_album.id.clone();
+                tokio::spawn(async move {
+                    self_clone
+                        .fetch_and_store_cover_art(pool_clone, id_clone, url)
+                        .await;
+                });
+            }
+        }
+
+        Ok(album)
+    }
+
+    /// Calls the Spotify search API and returns the raw parsed response items.
+    /// 429 and non-2xx responses are turned into descriptive errors so callers
+    /// can propagate or surface them appropriately.
+    async fn search_api(&self, query: &str) -> Result<Vec<SpotifyApiAlbum>, ServerFnError> {
+        let token = self.token().await?;
+
+        let response = self
+            .http
+            .get("https://api.spotify.com/v1/search")
+            .query(&[("q", query), ("type", "album"), ("limit", "10")])
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify search request: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let secs = retry_after_secs(&response);
+            return Err(ServerFnError::new(format!(
+                "Spotify rate limited — retry after {secs}s"
+            )));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(ServerFnError::new(format!(
+                "Spotify search failed: HTTP {status}"
+            )));
+        }
+
+        let body: SpotifySearchResponse = response
+            .json()
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify search parse: {e}")))?;
+
+        Ok(body.albums.items)
+    }
+
+    /// Downloads cover art bytes from a public Spotify CDN URL and stores them
+    /// in the `spotify_albums.cover_art` column. This is fire-and-forget: the
+    /// caller spawns it with `tokio::spawn` and does not await the result.
+    /// Errors are logged to stderr rather than propagated, because a missing
+    /// thumbnail should never block the user-facing response.
+    async fn fetch_and_store_cover_art(&self, pool: SqlitePool, spotify_id: String, url: String) {
+        let response = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("spotify cover art fetch error for {spotify_id}: {e}");
+                return;
+            }
+        };
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let secs = retry_after_secs(&response);
+            eprintln!("spotify cover art rate limited for {spotify_id}, retry after {secs}s");
+            return;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            eprintln!("spotify cover art HTTP {status} for {spotify_id}");
+            return;
+        }
+
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("spotify cover art read error for {spotify_id}: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = sqlx::query(
+            "UPDATE spotify_albums SET cover_art = ? WHERE spotify_id = ?",
+        )
+        .bind(bytes.as_ref())
+        .bind(&spotify_id)
+        .execute(&pool)
+        .await
+        {
+            eprintln!("spotify cover art store error for {spotify_id}: {e}");
+        }
+    }
+
+    /// Re-fetches album metadata from the Spotify API and updates all non-count
+    /// fields in `spotify_albums`. If the cover art URL has changed, re-fetches
+    /// the image too. Called in the background every 100 search hits to keep
+    /// cached metadata reasonably fresh without adding latency to searches.
+    async fn refresh_album(&self, pool: SqlitePool, spotify_id: String) {
+        let token = match self.token().await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("spotify refresh token error for {spotify_id}: {e}");
+                return;
+            }
+        };
+
+        let response = match self
+            .http
+            .get(format!(
+                "https://api.spotify.com/v1/albums/{}",
+                spotify_id
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("spotify refresh request error for {spotify_id}: {e}");
+                return;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            eprintln!("spotify refresh HTTP {status} for {spotify_id}");
+            return;
+        }
+
+        let api_album: SpotifyApiAlbum = match response.json().await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("spotify refresh parse error for {spotify_id}: {e}");
+                return;
+            }
+        };
+
+        let new_cover_url = best_image_url(&api_album.images);
+        let artists_json = match serde_json::to_string(
+            &api_album
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+        ) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("spotify refresh artists serialize error for {spotify_id}: {e}");
+                return;
+            }
+        };
+        let raw_json = serde_json::to_string(&AlbumRaw {
+            id: &api_album.id,
+            name: &api_album.name,
+        })
+        .unwrap_or_default();
+
+        // Read the old cover_art_url so we know if it changed.
+        let old_cover_url: Option<String> = sqlx::query_scalar(
+            "SELECT cover_art_url FROM spotify_albums WHERE spotify_id = ?",
+        )
+        .bind(&spotify_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None)
+        .flatten();
+
+        if let Err(e) = sqlx::query(
+            "UPDATE spotify_albums \
+             SET title = ?, artists = ?, album_type = ?, release_date = ?, \
+                 cover_art_url = ?, raw_json = ?, cached_at = datetime('now') \
+             WHERE spotify_id = ?",
+        )
+        .bind(&api_album.name)
+        .bind(&artists_json)
+        .bind(&api_album.album_type)
+        .bind(api_album.release_date.as_deref())
+        .bind(new_cover_url.as_deref())
+        .bind(&raw_json)
+        .bind(&spotify_id)
+        .execute(&pool)
+        .await
+        {
+            eprintln!("spotify refresh DB update error for {spotify_id}: {e}");
+            return;
+        }
+
+        // Re-fetch cover art only if the URL changed.
+        if new_cover_url.is_some() && new_cover_url != old_cover_url {
+            if let Some(url) = new_cover_url {
+                self.fetch_and_store_cover_art(pool, spotify_id, url).await;
+            }
+        }
+    }
+
+    /// Loads albums from the `spotify_albums` DB table in the order given by
+    /// `ids`, incrementing each album's `search_hit_count` and triggering a
+    /// background refresh every 100 hits. IDs missing from the table are
+    /// skipped defensively — this should not happen in normal operation.
+    ///
+    /// We count cache hits too, not just API misses, because the refresh
+    /// cadence should reflect how often users actually see an album, not how
+    /// often we had to phone Spotify for it.
+    async fn load_albums_by_ids_and_bump(
+        &self,
+        pool: &SqlitePool,
+        ids: &[String],
+    ) -> Result<Vec<SpotifyAlbum>, ServerFnError> {
+        let mut albums = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(row) = fetch_db_album(pool, id).await? {
+                let new_count: i64 = sqlx::query_scalar(
+                    "UPDATE spotify_albums SET search_hit_count = search_hit_count + 1 \
+                     WHERE spotify_id = ? \
+                     RETURNING search_hit_count",
+                )
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| ServerFnError::new(format!("spotify hit count update: {e}")))?;
+
+                if new_count % 100 == 0 {
+                    let self_clone = self.clone();
+                    let pool_clone = pool.clone();
+                    let id_clone = id.clone();
+                    tokio::spawn(async move {
+                        self_clone.refresh_album(pool_clone, id_clone).await;
+                    });
+                }
+
+                albums.push(spotify_album_from_db(&row));
+            }
+        }
+        Ok(albums)
+    }
+}
+
+// --- DB helpers ---
+
+/// Data needed to insert or update a row in `spotify_albums`.
+struct AlbumInsert<'a> {
+    spotify_id: &'a str,
+    title: &'a str,
+    artists_json: &'a str,
+    album_type: &'a str,
+    release_date: Option<&'a str>,
+    cover_art_url: Option<&'a str>,
+    raw_json: &'a str,
+}
+
+/// Fetches a single album row from `spotify_albums` by ID. Returns None when
+/// the album is not yet cached locally.
+async fn fetch_db_album(
+    pool: &SqlitePool,
+    spotify_id: &str,
+) -> Result<Option<DbSpotifyAlbum>, ServerFnError> {
+    let row = sqlx::query(
+        "SELECT spotify_id, title, artists, album_type, release_date, cover_art \
+         FROM spotify_albums WHERE spotify_id = ?",
+    )
+    .bind(spotify_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ServerFnError::new(format!("spotify db fetch: {e}")))?;
+
+    Ok(row.map(|r| DbSpotifyAlbum {
+        spotify_id: r.get("spotify_id"),
+        title: r.get("title"),
+        artists: r.get("artists"),
+        album_type: r.get("album_type"),
+        release_date: r.get("release_date"),
+        cover_art: r.get("cover_art"),
+    }))
+}
+
+/// Inserts or updates an album row. ON CONFLICT preserves `search_hit_count`
+/// (which is managed separately) while refreshing all metadata columns. The
+/// `cached_at` column is updated only on insert so the 24-hour cache TTL
+/// reflects when we first saw this album from search, not every upsert.
+async fn upsert_album(pool: &SqlitePool, data: &AlbumInsert<'_>) -> Result<(), ServerFnError> {
+    sqlx::query(
+        "INSERT INTO spotify_albums \
+             (spotify_id, title, artists, album_type, release_date, cover_art_url, raw_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(spotify_id) DO UPDATE SET \
+             title         = excluded.title, \
+             artists       = excluded.artists, \
+             album_type    = excluded.album_type, \
+             release_date  = excluded.release_date, \
+             cover_art_url = excluded.cover_art_url, \
+             raw_json      = excluded.raw_json",
+    )
+    .bind(data.spotify_id)
+    .bind(data.title)
+    .bind(data.artists_json)
+    .bind(data.album_type)
+    .bind(data.release_date)
+    .bind(data.cover_art_url)
+    .bind(data.raw_json)
+    .execute(pool)
+    .await
+    .map_err(|e| ServerFnError::new(format!("spotify album upsert: {e}")))?;
+
+    Ok(())
+}
+
+// --- Conversion helpers ---
+
+/// Converts a DB row into the public `SpotifyAlbum` type that server fns return.
+/// `release_year` is extracted from the first four characters of `release_date`,
+/// which Spotify supplies as YYYY, YYYY-MM, or YYYY-MM-DD.
+fn spotify_album_from_db(row: &DbSpotifyAlbum) -> SpotifyAlbum {
+    let artists: Vec<String> =
+        serde_json::from_str(&row.artists).unwrap_or_default();
+
+    let release_year = row
+        .release_date
+        .as_deref()
+        .and_then(|d| d.get(..4))
+        .and_then(|y| y.parse::<u32>().ok());
+
+    SpotifyAlbum {
+        spotify_id: row.spotify_id.clone(),
+        title: row.title.clone(),
+        artists,
+        album_type: row.album_type.clone().unwrap_or_default(),
+        release_year,
+        has_cover_art: row.cover_art.is_some(),
+    }
+}
+
+/// Converts a live Spotify API album object into the public `SpotifyAlbum` type.
+/// `has_cover_art` is always false here because we only store art asynchronously
+/// after the API call returns.
+fn spotify_album_from_api(api: &SpotifyApiAlbum) -> SpotifyAlbum {
+    let artists: Vec<String> = api.artists.iter().map(|a| a.name.clone()).collect();
+
+    let release_year = api
+        .release_date
+        .as_deref()
+        .and_then(|d| d.get(..4))
+        .and_then(|y| y.parse::<u32>().ok());
+
+    SpotifyAlbum {
+        spotify_id: api.id.clone(),
+        title: api.name.clone(),
+        artists,
+        album_type: api.album_type.clone(),
+        release_year,
+        has_cover_art: false,
+    }
+}
+
+/// Picks the best cover art URL from Spotify's images array. Spotify returns
+/// images sorted largest first; we prefer the largest available for quality,
+/// letting the UI resize as needed. Falls back to None if no images exist.
+fn best_image_url(images: &[SpotifyImage]) -> Option<String> {
+    // Prefer the image closest to 640px wide (high quality without being huge).
+    // Spotify typically provides 640, 300, and 64px variants.
+    images
+        .iter()
+        .max_by_key(|img| img.width.unwrap_or(0))
+        .map(|img| img.url.clone())
+}
+
+/// Reads the `Retry-After` header from a 429 response and parses it as a
+/// number of seconds. Defaults to 5 when the header is absent or unparseable,
+/// which is a reasonable back-off that avoids hammering the API.
+fn retry_after_secs(response: &reqwest::Response) -> u64 {
+    response
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5)
+}
+
+// Minimal struct used when serialising `raw_json` — we store the album ID and
+// name at minimum so the field is not empty, without pulling in the full
+// deserialized object which would require re-serialisation logic.
+#[derive(serde::Serialize)]
+struct AlbumRaw<'a> {
+    id: &'a str,
+    name: &'a str,
+}

@@ -1,5 +1,7 @@
 pub mod app;
 pub mod auth;
+#[cfg(feature = "ssr")]
+pub mod spotify;
 
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
