@@ -1,6 +1,6 @@
 #![cfg(feature = "ssr")]
 
-use crate::app::SpotifyAlbum;
+use crate::app::{AlbumDetail, SpotifyAlbum, Track};
 use leptos::server_fn::error::ServerFnError;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
@@ -29,11 +29,28 @@ struct SpotifyApiAlbum {
     album_type: String,
     release_date: Option<String>,
     images: Vec<SpotifyImage>,
+    // Present when fetching a single album; absent in search results.
+    tracks: Option<SpotifyTrackPage>,
 }
 
 #[derive(Deserialize)]
 struct SpotifyApiArtist {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct SpotifyTrackPage {
+    items: Vec<SpotifyApiTrack>,
+}
+
+#[derive(Deserialize)]
+struct SpotifyApiTrack {
+    id: String,
+    name: String,
+    artists: Vec<SpotifyApiArtist>,
+    disc_number: u32,
+    track_number: u32,
+    duration_ms: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -389,6 +406,174 @@ impl SpotifyClient {
         Ok(album)
     }
 
+    /// Cache-first album detail fetch: returns metadata and the full track listing.
+    /// Checks `spotify_tracks` first; if rows exist the method skips the Spotify
+    /// API entirely. On a miss it calls `GET /v1/albums/{id}`, upserts metadata,
+    /// inserts tracks, and returns both. Only the first page of tracks (≤50) is
+    /// stored, which covers virtually all albums.
+    pub async fn get_album_detail(
+        &self,
+        pool: &SqlitePool,
+        spotify_id: &str,
+    ) -> Result<AlbumDetail, ServerFnError> {
+        if let Some(tracks) = self.load_cached_tracks(pool, spotify_id).await? {
+            let album = fetch_db_album(pool, spotify_id)
+                .await?
+                .map(|r| spotify_album_from_db(&r))
+                .ok_or_else(|| {
+                    ServerFnError::new(format!(
+                        "spotify_albums row missing for {spotify_id} despite cached tracks"
+                    ))
+                })?;
+            return Ok(AlbumDetail { album, tracks });
+        }
+
+        let token = self.token().await?;
+
+        let response = self
+            .http
+            .get(format!("https://api.spotify.com/v1/albums/{}", spotify_id))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify album detail request: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let secs = retry_after_secs(&response);
+            return Err(ServerFnError::new(format!(
+                "Spotify rate limited — retry after {secs}s"
+            )));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(ServerFnError::new(format!(
+                "Spotify album detail failed: HTTP {status}"
+            )));
+        }
+
+        let api_album: SpotifyApiAlbum = response
+            .json()
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify album detail parse: {e}")))?;
+
+        let album = spotify_album_from_api(&api_album);
+        let cover_art_url = best_image_url(&api_album.images);
+        let artists_json = serde_json::to_string(
+            &api_album
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| ServerFnError::new(format!("spotify artists serialize: {e}")))?;
+        let raw_json = serde_json::to_string(&AlbumRaw {
+            id: &api_album.id,
+            name: &api_album.name,
+        })
+        .unwrap_or_default();
+
+        upsert_album(
+            pool,
+            &AlbumInsert {
+                spotify_id: &api_album.id,
+                title: &album.title,
+                artists_json: &artists_json,
+                album_type: &album.album_type,
+                release_date: api_album.release_date.as_deref(),
+                cover_art_url: cover_art_url.as_deref(),
+                raw_json: &raw_json,
+            },
+        )
+        .await?;
+
+        if !album.has_cover_art {
+            if let Some(url) = cover_art_url {
+                let self_clone = self.clone();
+                let pool_clone = pool.clone();
+                let id_clone = api_album.id.clone();
+                tokio::spawn(async move {
+                    self_clone
+                        .fetch_and_store_cover_art(pool_clone, id_clone, url)
+                        .await;
+                });
+            }
+        }
+
+        let api_tracks = api_album.tracks.map(|p| p.items).unwrap_or_default();
+        let mut tracks: Vec<Track> = Vec::with_capacity(api_tracks.len());
+
+        for t in &api_tracks {
+            let track_artists_json = serde_json::to_string(
+                &t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            )
+            .map_err(|e| ServerFnError::new(format!("spotify track artists serialize: {e}")))?;
+
+            sqlx::query(
+                "INSERT OR IGNORE INTO spotify_tracks \
+                 (spotify_id, track_id, disc_number, track_number, name, artists, duration_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(spotify_id)
+            .bind(&t.id)
+            .bind(t.disc_number)
+            .bind(t.track_number)
+            .bind(&t.name)
+            .bind(&track_artists_json)
+            .bind(t.duration_ms)
+            .execute(pool)
+            .await
+            .map_err(|e| ServerFnError::new(format!("spotify track insert: {e}")))?;
+
+            tracks.push(track_from_api(t));
+        }
+
+        Ok(AlbumDetail { album, tracks })
+    }
+
+    /// Loads cached tracks from `spotify_tracks` ordered by disc and track
+    /// number. Returns `None` on a cache miss (no rows for this album), which
+    /// the caller uses to decide whether to hit the Spotify API. An empty result
+    /// set is treated as a miss because real albums always have at least one track.
+    async fn load_cached_tracks(
+        &self,
+        pool: &SqlitePool,
+        spotify_id: &str,
+    ) -> Result<Option<Vec<Track>>, ServerFnError> {
+        let rows = sqlx::query(
+            "SELECT track_id, disc_number, track_number, name, artists, duration_ms \
+             FROM spotify_tracks WHERE spotify_id = ? \
+             ORDER BY disc_number, track_number",
+        )
+        .bind(spotify_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ServerFnError::new(format!("spotify tracks DB fetch: {e}")))?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let tracks = rows
+            .iter()
+            .map(|r| {
+                let artists_json: String = r.get("artists");
+                let artists: Vec<String> =
+                    serde_json::from_str(&artists_json).unwrap_or_default();
+                Track {
+                    track_id: r.get("track_id"),
+                    disc_number: r.get::<i64, _>("disc_number") as u32,
+                    track_number: r.get::<i64, _>("track_number") as u32,
+                    name: r.get("name"),
+                    artists,
+                    duration_ms: r.get::<Option<i64>, _>("duration_ms").map(|v| v as u32),
+                }
+            })
+            .collect();
+
+        Ok(Some(tracks))
+    }
+
     /// Calls the Spotify search API and returns the raw parsed response items.
     /// 429 and non-2xx responses are turned into descriptive errors so callers
     /// can propagate or surface them appropriately.
@@ -729,6 +914,18 @@ fn spotify_album_from_api(api: &SpotifyApiAlbum) -> SpotifyAlbum {
         album_type: api.album_type.clone(),
         release_year,
         has_cover_art: false,
+    }
+}
+
+/// Converts a Spotify API track object into the public `Track` type.
+fn track_from_api(t: &SpotifyApiTrack) -> Track {
+    Track {
+        track_id: t.id.clone(),
+        disc_number: t.disc_number,
+        track_number: t.track_number,
+        name: t.name.clone(),
+        artists: t.artists.iter().map(|a| a.name.clone()).collect(),
+        duration_ms: t.duration_ms,
     }
 }
 

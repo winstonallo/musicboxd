@@ -1,8 +1,9 @@
 use leptos::prelude::*;
 use leptos_meta::*;
 use leptos_router::{
-    components::{FlatRoutes, Route, Router},
-    StaticSegment,
+    components::{A, FlatRoutes, Route, Router},
+    hooks::{use_navigate, use_params_map, use_query_map},
+    ParamSegment, StaticSegment,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,24 @@ pub struct SpotifyAlbum {
     pub has_cover_art: bool,
 }
 
+/// A single track as returned by the album detail server fn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Track {
+    pub track_id: String,
+    pub disc_number: u32,
+    pub track_number: u32,
+    pub name: String,
+    pub artists: Vec<String>,
+    pub duration_ms: Option<u32>,
+}
+
+/// Album metadata combined with its full track listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlbumDetail {
+    pub album: SpotifyAlbum,
+    pub tracks: Vec<Track>,
+}
+
 #[server]
 pub async fn get_current_user() -> Result<Option<String>, ServerFnError> {
     use crate::auth::server::CurrentUser;
@@ -38,6 +57,16 @@ pub async fn search_music(query: String) -> Result<Vec<SpotifyAlbum>, ServerFnEr
     let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
     let Extension(spotify): Extension<SpotifyClient> = leptos_axum::extract().await?;
     spotify.search(&pool, &query).await
+}
+
+#[server]
+pub async fn get_album_detail(spotify_id: String) -> Result<AlbumDetail, ServerFnError> {
+    use crate::spotify::SpotifyClient;
+    use axum::Extension;
+    use sqlx::SqlitePool;
+    let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
+    let Extension(spotify): Extension<SpotifyClient> = leptos_axum::extract().await?;
+    spotify.get_album_detail(&pool, &spotify_id).await
 }
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
@@ -68,6 +97,7 @@ pub fn App() -> impl IntoView {
             <main>
                 <FlatRoutes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=(StaticSegment("album"), ParamSegment("id")) view=AlbumPage/>
                 </FlatRoutes>
             </main>
         </Router>
@@ -76,21 +106,28 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn HomePage() -> impl IntoView {
-    let (input, set_input) = signal(String::new());
-    let (query, set_query) = signal(String::new());
+    let query_map = use_query_map();
+    let navigate = use_navigate();
+
+    // Query is the URL's ?q parameter so it survives back-navigation and refresh.
+    let url_q = move || query_map.read().get("q").unwrap_or_default();
+
+    // Text box tracks what the user is typing; initialised from the URL so a
+    // refresh or back-button press restores the visible query.
+    let (input, set_input) = signal(url_q());
+
+    // When the URL changes (e.g. browser back button), resync the text box.
+    Effect::new(move |_| set_input.set(url_q()));
 
     let current_user = Resource::new(|| (), |_| get_current_user());
 
-    let results = Resource::new(
-        move || query.get(),
-        |q| async move {
-            if q.trim().is_empty() {
-                Ok(vec![])
-            } else {
-                search_music(q).await
-            }
-        },
-    );
+    let results = Resource::new(url_q, |q| async move {
+        if q.trim().is_empty() {
+            Ok(vec![])
+        } else {
+            search_music(q).await
+        }
+    });
 
     view! {
         <header class="site-header">
@@ -104,8 +141,14 @@ fn HomePage() -> impl IntoView {
                                 <a class="auth-link" rel="external" href="/auth/logout">"Sign out"</a>
                             }.into_any(),
                             _ => view! {
-                                <a class="auth-link" rel="external" href="/auth/google">"Sign in with Google"</a>
-                                <a class="auth-link" rel="external" href="/auth/github">"Sign in with GitHub"</a>
+                                <a class="auth-link oauth-btn" rel="external" href="/auth/google">
+                                    <img class="oauth-icon" src="/google-icon.svg" alt="" width="14" height="14"/>
+                                    "Sign in with Google"
+                                </a>
+                                <a class="auth-link oauth-btn" rel="external" href="/auth/github">
+                                    <img class="oauth-icon" src="/github-icon.svg" alt="" width="14" height="14"/>
+                                    "Sign in with GitHub"
+                                </a>
                             }.into_any(),
                         }
                     })}
@@ -114,7 +157,13 @@ fn HomePage() -> impl IntoView {
         </header>
         <form class="search-form" on:submit=move |ev| {
             ev.prevent_default();
-            set_query.set(input.get_untracked());
+            let q = input.get_untracked();
+            let dest = if q.trim().is_empty() {
+                "/".to_string()
+            } else {
+                format!("/?q={}", url_encode_query(&q))
+            };
+            navigate(&dest, Default::default());
         }>
             <input
                 class="search-input"
@@ -127,7 +176,7 @@ fn HomePage() -> impl IntoView {
         </form>
         <Suspense fallback=move || view! { <p class="status-msg">"Searching..."</p> }>
             {move || {
-                if query.get().trim().is_empty() {
+                if url_q().trim().is_empty() {
                     return None;
                 }
                 results.get().map(|res| {
@@ -139,7 +188,8 @@ fn HomePage() -> impl IntoView {
                             view! {
                                 <ul class="results-list">
                                     {albums.into_iter().map(|album| {
-                                                        let cover_src = format!("/album-art/{}", album.spotify_id);
+                                        let cover_src = format!("/album-art/{}", album.spotify_id);
+                                        let href = format!("/album/{}", album.spotify_id);
                                         let artists = album.artists.join(", ");
                                         let year = album
                                             .release_year
@@ -147,15 +197,17 @@ fn HomePage() -> impl IntoView {
                                             .unwrap_or_else(|| "????".to_string());
                                         view! {
                                             <li class="result-card">
-                                                <img class="result-cover" src=cover_src alt="Album cover" width="72" height="72"/>
-                                                <div class="result-info">
-                                                    <span class="result-title">{album.title}</span>
-                                                    <span class="result-artist">{artists}</span>
-                                                    <div class="result-meta">
-                                                        <span class="result-type">{album.album_type}</span>
-                                                        <span class="result-year">{year}</span>
+                                                <A href=href attr:class="result-card-link">
+                                                    <img class="result-cover" src=cover_src alt="Album cover" width="72" height="72"/>
+                                                    <div class="result-info">
+                                                        <span class="result-title">{album.title}</span>
+                                                        <span class="result-artist">{artists}</span>
+                                                        <div class="result-meta">
+                                                            <span class="result-type">{album.album_type}</span>
+                                                            <span class="result-year">{year}</span>
+                                                        </div>
                                                     </div>
-                                                </div>
+                                                </A>
                                             </li>
                                         }
                                     }).collect_view()}
@@ -170,4 +222,84 @@ fn HomePage() -> impl IntoView {
             }}
         </Suspense>
     }
+}
+
+#[component]
+fn AlbumPage() -> impl IntoView {
+    let params = use_params_map();
+    let spotify_id = move || params.read().get("id").unwrap_or_default();
+
+    let detail = Resource::new(spotify_id, |id| async move { get_album_detail(id).await });
+
+    view! {
+        <header class="site-header">
+            <A href="/" attr:class="logo">"Musicboxd"</A>
+        </header>
+        <Suspense fallback=move || view! { <p class="status-msg">"Loading..."</p> }>
+            {move || detail.get().map(|res| match res {
+                Err(e) => view! {
+                    <p class="status-msg">"Error: " {e.to_string()}</p>
+                }.into_any(),
+                Ok(d) => {
+                    let cover_src = format!("/album-art/{}", d.album.spotify_id);
+                    let artists = d.album.artists.join(", ");
+                    let year = d.album.release_year.map(|y| y.to_string()).unwrap_or_else(|| "????".to_string());
+                    view! {
+                        <div class="album-detail">
+                            <div class="album-header">
+                                <img class="album-cover" src=cover_src alt="Album cover" width="200" height="200"/>
+                                <div class="album-meta">
+                                    <h1 class="album-title">{d.album.title}</h1>
+                                    <p class="album-artists">{artists}</p>
+                                    <p class="album-info">
+                                        <span class="album-type">{d.album.album_type}</span>
+                                        " · "
+                                        <span class="album-year">{year}</span>
+                                    </p>
+                                </div>
+                            </div>
+                            <ul class="track-list">
+                                {d.tracks.into_iter().map(|track| {
+                                    let duration = format_duration(track.duration_ms);
+                                    let track_artists = track.artists.join(", ");
+                                    view! {
+                                        <li class="track-row">
+                                            <span class="track-num">{track.track_number}</span>
+                                            <div class="track-info">
+                                                <div class="track-name">{track.name}</div>
+                                                {(!track_artists.is_empty()).then(|| view! {
+                                                    <div class="track-artists">{track_artists}</div>
+                                                })}
+                                            </div>
+                                            <span class="track-duration">{duration}</span>
+                                        </li>
+                                    }
+                                }).collect_view()}
+                            </ul>
+                        </div>
+                    }.into_any()
+                }
+            })}
+        </Suspense>
+    }
+}
+
+/// Encodes a search query for use in a URL query string.
+/// Converts spaces to `+` and percent-encodes the characters that are
+/// structurally significant in a URL (`%`, `&`, `#`, `+`).
+fn url_encode_query(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('&', "%26")
+        .replace('#', "%23")
+        .replace('+', "%2B")
+        .replace(' ', "+")
+}
+
+fn format_duration(ms: Option<u32>) -> String {
+    let ms = match ms {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    let total_secs = ms / 1000;
+    format!("{}:{:02}", total_secs / 60, total_secs % 60)
 }

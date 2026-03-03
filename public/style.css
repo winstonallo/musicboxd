@@ -3,7 +3,7 @@
  *
  * Color reference:
  *   - GridSound DAW (gridsound/daw): #333 base, #ddd text, --gsui-font-monospace for technical data
- *   - FL Studio 21: #1e1e1e bg, #e8a000 amber accent, barely-rounded controls
+ *   - FL Studio 21: #1e1e1e bg, grey accent, barely-rounded controls
  *   - hundredrabbits/Themes (Orca): single saturated accent on near-black ground
  *
  * Patterns reference:
@@ -30,10 +30,10 @@
     --border:       #383838;
     --border-hi:    #4e4e4e;   /* hover/focus */
 
-    /* Accent — FL Studio amber */
-    --accent:       #e8a000;
-    --accent-dim:   #b07800;
-    --accent-wash:  rgba(232, 160, 0, 0.10);
+    /* Accent — grey highlight */
+    --accent:       #a0a0a0;
+    --accent-dim:   #707070;
+    --accent-wash:  rgba(160, 160, 160, 0.10);
 
     /* Text */
     --text:         #c8c8c8;   /* GridSound uses #ddd; FL Studio slightly cooler */
@@ -81,6 +81,7 @@ body {
     letter-spacing: 3px;
     text-transform: uppercase;
     color: var(--accent);
+    text-decoration: none;
 }
 
 .header-auth {
@@ -111,12 +112,23 @@ body {
     color: var(--accent);
 }
 
+.oauth-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.oauth-icon {
+    display: block;
+    flex-shrink: 0;
+}
+
 /* ── Page content ───────────────────────────────────────────────────────── */
 
 main {
     max-width: 800px;
     margin: 0 auto;
-    padding: 20px 16px;
+    padding: 28px 28px;
 }
 
 /* ── Search panel ───────────────────────────────────────────────────────── */
@@ -190,23 +202,34 @@ main {
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 6px;
 }
 
 /* Playlist track pattern: panel bg + border + 3px left color bar.
-   Bar is neutral at rest, amber on hover (FL Studio track indicator). */
+   Bar is neutral at rest, grey on hover (FL Studio track indicator).
+   The card is a plain block; the inner <a> handles flex layout so the
+   entire clickable area stretches edge-to-edge. */
 .result-card {
     position: relative;
     background: var(--bg-panel);
     border: 1px solid var(--border);
     border-radius: var(--radius);
+    overflow: hidden;
+    transition: background var(--dur), border-color var(--dur);
+    cursor: pointer;
+}
+
+/* Strip browser link styling and replicate the flex layout that used to
+   be on .result-card so the link fills the whole card. */
+.result-card-link {
     display: flex;
     align-items: center;
     gap: 12px;
-    overflow: hidden;
     padding: 8px 12px 8px 15px; /* left padding clears the 3px bar */
-    transition: background var(--dur), border-color var(--dur);
-    cursor: default;
+    color: inherit;
+    text-decoration: none;
+    width: 100%;
+    min-width: 0;
 }
 
 .result-card::before {
@@ -290,6 +313,112 @@ main {
     font-weight: 600;
     color: var(--accent-dim);
     margin-left: auto;
+}
+
+/* ── Album detail ───────────────────────────────────────────────────────── */
+
+.album-detail {
+    max-width: 600px;
+    margin: 0 auto;
+}
+
+/* Cover centred above the meta text, generous vertical breathing room. */
+.album-header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 32px 0 36px;
+    gap: 18px;
+}
+
+.album-cover {
+    width: 200px;
+    height: 200px;
+    object-fit: cover;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--bg-control);
+    flex-shrink: 0;
+}
+
+.album-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: 0.2px;
+    margin: 0;
+}
+
+.album-artists {
+    font-size: 13px;
+    color: var(--text-dim);
+    margin: 0;
+}
+
+.album-info {
+    font-size: 11px;
+    color: var(--text-muted);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    margin: 0;
+}
+
+.album-type { font-weight: 700; }
+
+/* Track list indented from both edges so it doesn't hug the screen sides. */
+.track-list {
+    list-style: none;
+    padding: 0 32px;
+    border-top: 1px solid var(--border);
+}
+
+.track-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+/* Monospace number, right-aligned, fixed width so the title column lines up. */
+.track-num {
+    width: 28px;
+    text-align: right;
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.track-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.track-name {
+    font-size: 13px;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.track-artists {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.track-duration {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    letter-spacing: 0.5px;
 }
 
 /* ── Status messages ────────────────────────────────────────────────────── */
