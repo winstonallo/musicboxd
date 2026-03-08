@@ -24,6 +24,8 @@ Built with **Tauri** (web-first, expandable to desktop/mobile). The frontend run
 
 Every feature must be covered by tests. Tests must be **breakable** — if you delete or break the feature, the test must fail. Acceptable levels: unit, integration, or e2e. Superficial tests that pass regardless of the feature's correctness are not acceptable.
 
+Every bug fix must include a test that reproduces the bug and fails without the fix. The test proves the bug existed and ensures it cannot regress silently.
+
 ## Commands
 
 | Command | Purpose |
