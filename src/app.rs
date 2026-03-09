@@ -881,7 +881,7 @@ fn AlbumPage() -> impl IntoView {
                                     }
                                 }).collect_view()}
                             </ul>
-                            <Suspense fallback=|| ()>
+                            <Transition fallback=|| ()>
                                 {move || {
                                     let user = current_user_res.get().and_then(|r| r.ok()).flatten();
                                     let rating = my_rating.get().and_then(|r| r.ok()).flatten().map(|mr| mr.rating);
@@ -898,6 +898,7 @@ fn AlbumPage() -> impl IntoView {
                                                 let sid2 = sid.clone();
                                                 view! {
                                                     <button
+                                                        type="button"
                                                         class=move || if selected { "rating-dot selected" } else if active { "rating-dot active" } else { "rating-dot" }
                                                         on:click=move |_| {
                                                             let s = sid2.clone();
@@ -923,6 +924,7 @@ fn AlbumPage() -> impl IntoView {
                                             on:input=move |ev| set_review_text.set(event_target_value(&ev))
                                         />
                                         <button
+                                            type="button"
                                             class="review-save-btn"
                                             disabled=move || my_rating.get().and_then(|r| r.ok()).flatten().is_none()
                                             on:click=move |_| {
@@ -940,7 +942,7 @@ fn AlbumPage() -> impl IntoView {
                                         >"Save review"</button>
                                     }.into_any()
                                 }}
-                            </Suspense>
+                            </Transition>
                         </div>
                     }.into_any()
                 }
