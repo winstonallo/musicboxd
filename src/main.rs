@@ -43,6 +43,16 @@ async fn main() {
 
     let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| format!("http://{}", addr));
 
+    // Validate BASE_URL format; a malformed value would cause OAuth client construction to
+    // fail at request time, so catch it here at startup where the error is visible.
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        eprintln!("Error: BASE_URL is not a valid URL (must start with http:// or https://): {base_url}");
+        std::process::exit(1);
+    }
+    if !base_url.starts_with("https://") {
+        eprintln!("Warning: BASE_URL does not use HTTPS ({base_url}). This is insecure in production.");
+    }
+
     let oauth_config = OAuthConfig::from_env(&base_url).unwrap_or_else(|e| {
         eprintln!("Warning: OAuth not configured ({e}). Sign-in will be unavailable.");
         OAuthConfig {
