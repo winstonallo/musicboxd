@@ -90,7 +90,18 @@ Unused code is useless and must be removed. Dead code, unreferenced exports, unu
 
 Every feature is developed on a dedicated branch, created from `main`. Do not commit feature work directly to `main`.
 
-A feature branch is merged only once its functionality is verified — tests pass, the build succeeds, and the feature behaves as specified. Always merge by rebasing onto `main` (`git rebase main`) and fast-forwarding — never create merge commits.
+A feature branch is merged only once its functionality is verified — tests pass, the build succeeds, and the feature behaves as specified. The full merge sequence is:
+
+```
+git fetch origin main
+git rebase origin/main          # rebase feature branch onto current main
+git push origin <branch>        # push rebased branch
+git checkout main
+git merge --ff-only <branch>    # fast-forward main; never create merge commits
+git push origin main
+git branch -d <branch>          # delete local branch
+git push origin --delete <branch>  # delete remote branch
+```
 
 ## Commits
 
