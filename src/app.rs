@@ -53,6 +53,12 @@ pub struct UserProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyRating {
+    pub rating: u8,
+    pub review: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRating {
     pub spotify_id: String,
     pub title: String,
@@ -61,6 +67,7 @@ pub struct UserRating {
     pub release_year: Option<u32>,
     pub has_cover_art: bool,
     pub rating: u8,
+    pub review: Option<String>,
     pub rated_at: String,
 }
 
@@ -236,7 +243,7 @@ pub async fn get_user_ratings(username: String) -> Result<Vec<UserRating>, Serve
 
     let rows = sqlx::query(
         "SELECT sa.spotify_id, sa.title, sa.artists, sa.album_type, sa.release_date, \
-         sa.cover_art IS NOT NULL AS has_cover_art, r.rating, r.created_at AS rated_at \
+         sa.cover_art IS NOT NULL AS has_cover_art, r.rating, r.review, r.created_at AS rated_at \
          FROM ratings r \
          JOIN users u ON r.user_id = u.user_id \
          JOIN release_groups rg ON r.release_group_id = rg.release_group_id \
@@ -269,6 +276,7 @@ pub async fn get_user_ratings(username: String) -> Result<Vec<UserRating>, Serve
                 release_year,
                 has_cover_art,
                 rating: row.get::<i64, _>("rating") as u8,
+                review: row.get("review"),
                 rated_at: row.get("rated_at"),
             }
         })
@@ -326,6 +334,30 @@ pub async fn rate_album(spotify_id: String, rating: u8) -> Result<(), ServerFnEr
     .bind(&viewer.user_id)
     .bind(&rg_id)
     .bind(rating as i64)
+    .execute(&pool)
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    Ok(())
+}
+
+#[server]
+pub async fn delete_rating(spotify_id: String) -> Result<(), ServerFnError> {
+    use crate::auth::server::CurrentUser;
+    use axum::Extension;
+    use sqlx::SqlitePool;
+
+    let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
+    let Extension(viewer): Extension<Option<CurrentUser>> = leptos_axum::extract().await?;
+    let viewer = viewer.ok_or_else(|| ServerFnError::new("Not logged in".to_string()))?;
+
+    sqlx::query(
+        "DELETE FROM ratings \
+         WHERE user_id = ? \
+         AND release_group_id = (SELECT release_group_id FROM release_groups WHERE spotify_id = ?)",
+    )
+    .bind(&viewer.user_id)
+    .bind(&spotify_id)
     .execute(&pool)
     .await
     .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -849,7 +881,11 @@ fn AlbumPage() -> impl IntoView {
                                                         on:click=move |_| {
                                                             let s = sid2.clone();
                                                             leptos::task::spawn_local(async move {
-                                                                let _ = rate_album(s, dot).await;
+                                                                if selected {
+                                                                    let _ = delete_rating(s).await;
+                                                                } else {
+                                                                    let _ = rate_album(s, dot).await;
+                                                                }
                                                                 my_rating.refetch();
                                                             });
                                                         }
