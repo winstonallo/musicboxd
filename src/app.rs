@@ -805,7 +805,7 @@ fn HomePage() -> impl IntoView {
                         }.into_any(),
                         Ok(_) => view! {
                             <div class="load-more-bar">
-                                <button class="load-more-btn"
+                                <button class="load-more-btn" type="button"
                                     on:click=move |_| set_page.update(|p| *p += 1)>
                                     "Load more"
                                 </button>
@@ -999,7 +999,7 @@ fn ProfilePage() -> impl IntoView {
                             <div class="profile-actions">
                                 {if is_self {
                                     view! {
-                                        <button class="follow-btn" on:click=move |_| {
+                                        <button class="follow-btn" type="button" on:click=move |_| {
                                             set_edit_username.set(username());
                                             set_edit_bio.set(bio.clone().unwrap_or_default());
                                             set_edit_error.set(None);
@@ -1009,7 +1009,7 @@ fn ProfilePage() -> impl IntoView {
                                 } else if is_following {
                                     let uname = profile_username.clone();
                                     view! {
-                                        <button class="follow-btn following" on:click=move |_| {
+                                        <button class="follow-btn following" type="button" on:click=move |_| {
                                             let u = uname.clone();
                                             leptos::task::spawn_local(async move {
                                                 let _ = unfollow_user(u).await;
@@ -1020,7 +1020,7 @@ fn ProfilePage() -> impl IntoView {
                                 } else {
                                     let uname = profile_username.clone();
                                     view! {
-                                        <button class="follow-btn" on:click=move |_| {
+                                        <button class="follow-btn" type="button" on:click=move |_| {
                                             let u = uname.clone();
                                             leptos::task::spawn_local(async move {
                                                 let _ = follow_user(u).await;
@@ -1193,7 +1193,7 @@ fn UserSearchPage() -> impl IntoView {
                                             let btn_label = if is_following { "Unfollow" } else { "Follow" };
                                             view! {
                                                 <div class="user-result-actions">
-                                                    <button class=btn_class on:click=move |_| {
+                                                    <button class=btn_class type="button" on:click=move |_| {
                                                         let u = uname.clone();
                                                         leptos::task::spawn_local(async move {
                                                             if is_following {
@@ -1326,7 +1326,7 @@ fn FollowListPage(is_followers: bool) -> impl IntoView {
                                 let btn_label = if is_following { "Unfollow" } else { "Follow" };
                                 view! {
                                     <div class="user-result-actions">
-                                        <button class=btn_class on:click=move |_| {
+                                        <button class=btn_class type="button" on:click=move |_| {
                                             let uu = u.clone();
                                             leptos::task::spawn_local(async move {
                                                 if is_following {
@@ -1364,7 +1364,7 @@ fn FollowListPage(is_followers: bool) -> impl IntoView {
                 }.into_any(),
                 Ok(r) if r.has_more => view! {
                     <div class="load-more-bar">
-                        <button class="load-more-btn"
+                        <button class="load-more-btn" type="button"
                             on:click=move |_| set_page.update(|p| *p += 1)>
                             "Load more"
                         </button>
