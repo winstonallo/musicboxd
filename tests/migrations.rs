@@ -2,6 +2,7 @@ use sqlx::{Row, SqlitePool};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn all_tables_exist(pool: SqlitePool) {
     let tables: Vec<String> = sqlx::query_scalar(
@@ -31,35 +32,26 @@ async fn all_tables_exist(pool: SqlitePool) {
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn users_insert_with_empty_password_hash(pool: SqlitePool) {
-    sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES (?, ?, ?, '')",
+async fn password_hash_column_removed(pool: SqlitePool) {
+    let result = sqlx::query(
+        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
     )
-    .bind("u1")
-    .bind("alice")
-    .bind("alice@example.com")
     .execute(&pool)
-    .await
-    .expect("should insert user with empty password_hash");
-
-    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE user_id = 'u1'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(email, "alice@example.com");
+    .await;
+    assert!(result.is_err(), "password_hash column must not exist after migration 0008");
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn users_username_unique(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
     .unwrap();
 
     let result = sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u2', 'alice', 'b@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u2', 'alice', 'b@x.com')",
     )
     .execute(&pool)
     .await;
@@ -70,14 +62,14 @@ async fn users_username_unique(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn users_email_unique(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'same@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'same@x.com')",
     )
     .execute(&pool)
     .await
     .unwrap();
 
     let result = sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u2', 'bob', 'same@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u2', 'bob', 'same@x.com')",
     )
     .execute(&pool)
     .await;
@@ -88,7 +80,7 @@ async fn users_email_unique(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn oauth_accounts_links_to_user(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -113,7 +105,7 @@ async fn oauth_accounts_links_to_user(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn oauth_accounts_cascades_on_user_delete(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -141,7 +133,7 @@ async fn oauth_accounts_cascades_on_user_delete(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn oauth_accounts_provider_uid_unique_per_provider(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -208,7 +200,7 @@ async fn oauth_states_expired_not_returned(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn sessions_valid_session_returned(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -239,7 +231,7 @@ async fn sessions_valid_session_returned(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn sessions_expired_not_returned(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -268,7 +260,7 @@ async fn sessions_expired_not_returned(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn sessions_cascade_delete_with_user(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -297,7 +289,7 @@ async fn sessions_cascade_delete_with_user(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn follows_no_self_follow(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await

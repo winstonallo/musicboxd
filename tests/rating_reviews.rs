@@ -6,7 +6,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 // spotify_album (which rate_album needs to resolve a release_group_id from).
 async fn insert_fixtures(pool: &SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(pool)
     .await
@@ -164,7 +164,7 @@ async fn get_user_ratings_includes_review(pool: SqlitePool) {
 
     // Add a second user so we can test the username-based lookup.
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u2', 'bob', 'b@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u2', 'bob', 'b@x.com')",
     )
     .execute(&pool)
     .await

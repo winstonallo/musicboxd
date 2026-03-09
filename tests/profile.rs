@@ -5,7 +5,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn rate_album_upserts_release_group(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -65,7 +65,7 @@ async fn rate_album_upserts_release_group(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn rating_update_on_duplicate(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -122,13 +122,13 @@ async fn rating_update_on_duplicate(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn follow_and_unfollow(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u2', 'bob', 'b@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u2', 'bob', 'b@x.com')",
     )
     .execute(&pool)
     .await
@@ -162,7 +162,7 @@ async fn follow_and_unfollow(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn no_self_follow_db_constraint(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
@@ -178,13 +178,13 @@ async fn no_self_follow_db_constraint(pool: SqlitePool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn update_profile_rejects_taken_username(pool: SqlitePool) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u1', 'alice', 'a@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u1', 'alice', 'a@x.com')",
     )
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES ('u2', 'bob', 'b@x.com', '')",
+        "INSERT INTO users (user_id, username, email) VALUES ('u2', 'bob', 'b@x.com')",
     )
     .execute(&pool)
     .await

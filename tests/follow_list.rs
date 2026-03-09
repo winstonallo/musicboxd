@@ -33,7 +33,7 @@ const FOLLOWING_SQL: &str = "\
 
 async fn insert_user(pool: &SqlitePool, id: &str, username: &str) {
     sqlx::query(
-        "INSERT INTO users (user_id, username, email, password_hash) VALUES (?, ?, ?, '')",
+        "INSERT INTO users (user_id, username, email) VALUES (?, ?, ?)",
     )
     .bind(id)
     .bind(username)
