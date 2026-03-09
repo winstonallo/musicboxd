@@ -70,6 +70,10 @@ Create Claude Code skills (in `.claude/skills/`) for distinct, repeatable aspect
 
 Skills are tracked in version control like any other source file. The `.claude/skills/` directory is part of the repo — commit new and updated skills alongside the code changes that motivate them. Do not leave skills outside the repo or in a personal config directory.
 
+## Logging
+
+Log messages must carry information the reader does not already have. Do not restate what is obvious from context — "this is insecure in production" appended to an HTTP warning, "successfully completed" after an operation, or "starting X" before X starts add no value. Every log line should answer a question the reader could not answer without it.
+
 ## Error handling
 
 Errors must never be silently swallowed. Every error must be handled explicitly and propagated with enough context to identify its origin at every level of the call stack. Use structured error types rather than stringly-typed messages, and add context when wrapping errors as they propagate upward. A log line or a panic is acceptable at a top-level boundary; silently discarding an error is never acceptable.

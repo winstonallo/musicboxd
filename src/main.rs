@@ -53,7 +53,7 @@ async fn main() {
         std::process::exit(1);
     }
     if !base_url.starts_with("https://") {
-        eprintln!("Warning: BASE_URL does not use HTTPS ({base_url}). This is insecure in production.");
+        eprintln!("Warning: BASE_URL does not use HTTPS ({base_url}).");
     }
 
     let oauth_config = OAuthConfig::from_env(&base_url).unwrap_or_else(|e| {
