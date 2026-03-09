@@ -176,7 +176,31 @@ async fn main() {
         .layer(axum::middleware::from_fn(session_auth))
         .layer(Extension(oauth_config))
         .layer(Extension(spotify_client))
-        .layer(Extension(pool));
+        .layer(Extension(pool))
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::HeaderName::from_static("x-content-type-options"),
+                axum::http::HeaderValue::from_static("nosniff"),
+            ),
+        )
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::HeaderName::from_static("x-frame-options"),
+                axum::http::HeaderValue::from_static("DENY"),
+            ),
+        )
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::HeaderName::from_static("x-xss-protection"),
+                axum::http::HeaderValue::from_static("1; mode=block"),
+            ),
+        )
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::HeaderName::from_static("referrer-policy"),
+                axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+            ),
+        );
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     println!("Listening on http://{addr}");
