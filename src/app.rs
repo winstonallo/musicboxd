@@ -286,7 +286,11 @@ pub async fn get_user_ratings(username: String) -> Result<Vec<UserRating>, Serve
 }
 
 #[server]
-pub async fn rate_album(spotify_id: String, rating: u8) -> Result<(), ServerFnError> {
+pub async fn rate_album(
+    spotify_id: String,
+    rating: u8,
+    review: Option<String>,
+) -> Result<(), ServerFnError> {
     use crate::auth::server::CurrentUser;
     use axum::Extension;
     use sqlx::SqlitePool;
@@ -324,16 +328,18 @@ pub async fn rate_album(spotify_id: String, rating: u8) -> Result<(), ServerFnEr
 
     let rating_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO ratings (rating_id, user_id, release_group_id, rating) \
-         VALUES (?, ?, ?, ?) \
+        "INSERT INTO ratings (rating_id, user_id, release_group_id, rating, review) \
+         VALUES (?, ?, ?, ?, ?) \
          ON CONFLICT(user_id, release_group_id) DO UPDATE SET \
          rating = excluded.rating, \
+         review = excluded.review, \
          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
     )
     .bind(&rating_id)
     .bind(&viewer.user_id)
     .bind(&rg_id)
     .bind(rating as i64)
+    .bind(&review)
     .execute(&pool)
     .await
     .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -366,18 +372,18 @@ pub async fn delete_rating(spotify_id: String) -> Result<(), ServerFnError> {
 }
 
 #[server]
-pub async fn get_my_rating(spotify_id: String) -> Result<Option<u8>, ServerFnError> {
+pub async fn get_my_rating(spotify_id: String) -> Result<Option<MyRating>, ServerFnError> {
     use crate::auth::server::CurrentUser;
     use axum::Extension;
-    use sqlx::SqlitePool;
+    use sqlx::{Row, SqlitePool};
 
     let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
     let Extension(viewer): Extension<Option<CurrentUser>> = leptos_axum::extract().await?;
 
     let Some(viewer) = viewer else { return Ok(None) };
 
-    let rating: Option<i64> = sqlx::query_scalar(
-        "SELECT r.rating FROM ratings r \
+    let row = sqlx::query(
+        "SELECT r.rating, r.review FROM ratings r \
          JOIN release_groups rg ON r.release_group_id = rg.release_group_id \
          WHERE rg.spotify_id = ? AND r.user_id = ?",
     )
@@ -387,7 +393,10 @@ pub async fn get_my_rating(spotify_id: String) -> Result<Option<u8>, ServerFnErr
     .await
     .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    Ok(rating.map(|r| r as u8))
+    Ok(row.map(|r| MyRating {
+        rating: r.get::<i64, _>("rating") as u8,
+        review: r.get("review"),
+    }))
 }
 
 #[server]
@@ -818,6 +827,18 @@ fn AlbumPage() -> impl IntoView {
     let my_rating = Resource::new(spotify_id, |id| get_my_rating(id));
     let current_user_res = Resource::new(|| (), |_| get_current_user());
 
+    let (review_text, set_review_text) = signal(String::new());
+
+    Effect::new(move |_| {
+        let text = my_rating
+            .get()
+            .and_then(|r| r.ok())
+            .flatten()
+            .and_then(|mr| mr.review)
+            .unwrap_or_default();
+        set_review_text.set(text);
+    });
+
     view! {
         <Suspense fallback=move || view! { <p class="status-msg">"Loading..."</p> }>
             {move || detail.get().map(|res| match res {
@@ -863,7 +884,7 @@ fn AlbumPage() -> impl IntoView {
                             <Suspense fallback=|| ()>
                                 {move || {
                                     let user = current_user_res.get().and_then(|r| r.ok()).flatten();
-                                    let rating = my_rating.get().and_then(|r| r.ok()).flatten();
+                                    let rating = my_rating.get().and_then(|r| r.ok()).flatten().map(|mr| mr.rating);
                                     if user.is_none() {
                                         return view! { <p class="status-msg">"Sign in to rate this album."</p> }.into_any();
                                     }
@@ -880,11 +901,13 @@ fn AlbumPage() -> impl IntoView {
                                                         class=move || if selected { "rating-dot selected" } else if active { "rating-dot active" } else { "rating-dot" }
                                                         on:click=move |_| {
                                                             let s = sid2.clone();
+                                                            let review = review_text.get_untracked();
+                                                            let review = if review.trim().is_empty() { None } else { Some(review) };
                                                             leptos::task::spawn_local(async move {
                                                                 if selected {
                                                                     let _ = delete_rating(s).await;
                                                                 } else {
-                                                                    let _ = rate_album(s, dot).await;
+                                                                    let _ = rate_album(s, dot, review).await;
                                                                 }
                                                                 my_rating.refetch();
                                                             });
@@ -893,6 +916,28 @@ fn AlbumPage() -> impl IntoView {
                                                 }
                                             }).collect_view()}
                                         </div>
+                                        <textarea
+                                            class="review-textarea"
+                                            placeholder="Write a review..."
+                                            prop:value=move || review_text.get()
+                                            on:input=move |ev| set_review_text.set(event_target_value(&ev))
+                                        />
+                                        <button
+                                            class="review-save-btn"
+                                            disabled=move || my_rating.get().and_then(|r| r.ok()).flatten().is_none()
+                                            on:click=move |_| {
+                                                let current_rating = my_rating.get().and_then(|r| r.ok()).flatten().map(|mr| mr.rating);
+                                                if let Some(r) = current_rating {
+                                                    let s = sid.clone();
+                                                    let review = review_text.get_untracked();
+                                                    let review = if review.trim().is_empty() { None } else { Some(review) };
+                                                    leptos::task::spawn_local(async move {
+                                                        let _ = rate_album(s, r, review).await;
+                                                        my_rating.refetch();
+                                                    });
+                                                }
+                                            }
+                                        >"Save review"</button>
                                     }.into_any()
                                 }}
                             </Suspense>
@@ -1050,6 +1095,9 @@ fn ProfilePage() -> impl IntoView {
                                                                 <span class="result-type">{r.album_type}</span>
                                                                 <span class="result-year">{year}</span>
                                                             </div>
+                                                            {r.review.as_deref().filter(|rev| !rev.is_empty()).map(|rev| view! {
+                                                                <p class="rating-review">{rev.to_string()}</p>
+                                                            })}
                                                         </div>
                                                     </A>
                                                 </li>

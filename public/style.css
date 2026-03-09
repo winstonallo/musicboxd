@@ -671,6 +671,60 @@ main {
     font-weight: 600;
 }
 
+/* ── Review input ──────────────────────────────────────────────────────────── */
+
+.review-textarea {
+    width: 100%;
+    min-height: 80px;
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: var(--bg-control);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--font-sans);
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.review-textarea:focus {
+    outline: none;
+    border-color: var(--accent-dim);
+}
+
+.review-save-btn {
+    margin-top: 6px;
+    padding: 5px 14px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    font-size: 12px;
+    font-family: var(--font-mono);
+    cursor: pointer;
+    transition: background var(--dur), color var(--dur), border-color var(--dur);
+}
+
+.review-save-btn:hover:not(:disabled) {
+    background: var(--accent-wash);
+    border-color: var(--accent-dim);
+    color: var(--accent);
+}
+
+.review-save-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.rating-review {
+    margin: 4px 0 0;
+    font-size: 12px;
+    color: var(--text-dim);
+    font-style: italic;
+    line-height: 1.4;
+}
+
 /* ── Rating badge (profile ratings grid) ─────────────────────────────────── */
 
 .result-cover-wrap {
