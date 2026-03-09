@@ -1,6 +1,8 @@
 pub mod app;
 pub mod auth;
 #[cfg(feature = "ssr")]
+pub mod rate_limit;
+#[cfg(feature = "ssr")]
 pub mod spotify;
 
 #[cfg(feature = "hydrate")]

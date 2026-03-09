@@ -15,9 +15,12 @@ async fn main() {
         github_callback, github_login, google_callback, google_login, logout, session_auth,
         OAuthConfig,
     };
+    use musicboxd::rate_limit::server::{rate_limit_fn, RateLimitStore};
     use musicboxd::spotify::SpotifyClient;
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{Row, SqlitePool};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
 
     let conf = get_configuration(None).unwrap();
     let addr = conf.leptos_options.site_addr;
@@ -126,13 +129,32 @@ async fn main() {
         StatusCode::NOT_FOUND.into_response()
     }
 
-    let app = Router::new()
+    // Per-IP rate limiters for sensitive routes. Auth allows 10 req/60s per IP;
+    // album-art allows 30 req/60s per IP.
+    let auth_limiter: Arc<RateLimitStore> = Arc::new(RateLimitStore::new(10, 60));
+    let album_art_limiter: Arc<RateLimitStore> = Arc::new(RateLimitStore::new(30, 60));
+
+    let auth_routes = Router::new()
         .route("/auth/google", get(google_login))
         .route("/auth/google/callback", get(google_callback))
         .route("/auth/github", get(github_login))
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/logout", get(logout))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_limiter,
+            rate_limit_fn,
+        ));
+
+    let album_art_routes = Router::new()
         .route("/album-art/:spotify_id", get(album_art))
+        .route_layer(axum::middleware::from_fn_with_state(
+            album_art_limiter,
+            rate_limit_fn,
+        ));
+
+    let app = Router::new()
+        .merge(auth_routes)
+        .merge(album_art_routes)
         .leptos_routes_with_context(
             &leptos_options,
             routes,
@@ -158,9 +180,12 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     println!("Listening on http://{addr}");
-    axum::serve(listener, app.into_make_service())
-        .await
-        .unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 #[cfg(not(feature = "ssr"))]
