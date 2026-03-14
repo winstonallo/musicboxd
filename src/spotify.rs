@@ -650,9 +650,8 @@ impl SpotifyClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
             return Err(ServerFnError::new(format!(
-                "Spotify search failed: HTTP {status} — {body}"
+                "Spotify search failed: HTTP {status}"
             )));
         }
 

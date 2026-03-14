@@ -99,6 +99,16 @@ pub struct UserSearchResult {
     pub is_self: bool,
 }
 
+/// Spotify IDs are base-62 strings. Enforcing this before interpolating them
+/// into API URL paths prevents query/fragment injection into Spotify requests.
+#[cfg(feature = "ssr")]
+fn validate_spotify_id(id: &str) -> Result<(), ServerFnError> {
+    if id.is_empty() || id.len() > 100 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(ServerFnError::new("Invalid Spotify ID".to_string()));
+    }
+    Ok(())
+}
+
 #[server]
 pub async fn get_current_user() -> Result<Option<String>, ServerFnError> {
     use crate::auth::server::CurrentUser;
@@ -112,6 +122,9 @@ pub async fn search_music(query: String, page: u32) -> Result<SearchPage, Server
     use crate::spotify::SpotifyClient;
     use axum::Extension;
     use sqlx::SqlitePool;
+    if query.len() > 200 {
+        return Err(ServerFnError::new("Search query too long".to_string()));
+    }
     let page = page.max(1);
     let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
     let Extension(spotify): Extension<SpotifyClient> = leptos_axum::extract().await?;
@@ -123,6 +136,7 @@ pub async fn get_album_detail(spotify_id: String) -> Result<AlbumDetail, ServerF
     use crate::spotify::SpotifyClient;
     use axum::Extension;
     use sqlx::SqlitePool;
+    validate_spotify_id(&spotify_id)?;
     let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
     let Extension(spotify): Extension<SpotifyClient> = leptos_axum::extract().await?;
     spotify.get_album_detail(&pool, &spotify_id).await
@@ -226,6 +240,9 @@ pub async fn update_profile(new_username: String, new_bio: String) -> Result<(),
         return Err(ServerFnError::new("Username is already taken".to_string()));
     }
 
+    if new_bio.len() > 1000 {
+        return Err(ServerFnError::new("Bio must be 1000 characters or fewer".to_string()));
+    }
     let bio_val: Option<String> = if new_bio.is_empty() { None } else { Some(new_bio) };
 
     sqlx::query(
@@ -315,8 +332,17 @@ pub async fn rate_album(
     use sqlx::SqlitePool;
     use uuid::Uuid;
 
+    validate_spotify_id(&spotify_id)?;
     if rating < 1 || rating > 10 {
         return Err(ServerFnError::new("Rating must be between 1 and 10".to_string()));
+    }
+    if let Some(ref r) = review {
+        if r.len() > 5000 {
+            return Err(ServerFnError::new("Review must be 5000 characters or fewer".to_string()));
+        }
+    }
+    if let Some(ref id) = favorite_track_id {
+        validate_spotify_id(id)?;
     }
 
     let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
@@ -382,6 +408,7 @@ pub async fn delete_rating(spotify_id: String) -> Result<(), ServerFnError> {
     use crate::auth::server::CurrentUser;
     use axum::Extension;
     use sqlx::SqlitePool;
+    validate_spotify_id(&spotify_id)?;
 
     let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
     let Extension(viewer): Extension<Option<CurrentUser>> = leptos_axum::extract().await?;
@@ -409,6 +436,7 @@ pub async fn get_my_rating(spotify_id: String) -> Result<Option<MyRating>, Serve
     use crate::auth::server::CurrentUser;
     use axum::Extension;
     use sqlx::{Row, SqlitePool};
+    validate_spotify_id(&spotify_id)?;
 
     let Extension(pool): Extension<SqlitePool> = leptos_axum::extract().await?;
     let Extension(viewer): Extension<Option<CurrentUser>> = leptos_axum::extract().await?;
@@ -500,6 +528,9 @@ pub async fn search_users(query: String) -> Result<Vec<UserSearchResult>, Server
     let query = query.trim().to_string();
     if query.is_empty() {
         return Ok(vec![]);
+    }
+    if query.len() > 200 {
+        return Err(ServerFnError::new("Search query too long".to_string()));
     }
 
     // Empty string never matches a real UUID, so the LEFT JOIN naturally
