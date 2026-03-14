@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Waxlog — a music tracking and rating social app, analogous to Letterboxd but for music.
+Spinlog — a music tracking and rating social app, analogous to Letterboxd but for music.
 
 ## Agent workflow
 
